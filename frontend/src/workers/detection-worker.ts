@@ -39,7 +39,7 @@ const YOLO_CLASSES = [
 
 // Model configuration
 const MODEL_INPUT_SIZE = 640; // Model expects 640x640 input
-const CONFIDENCE_THRESHOLD = 0.05; // Lowered to encourage initial detections
+const CONFIDENCE_THRESHOLD = 0.1; // Lowered to see more detections
 const NMS_THRESHOLD = 0.4;
 
 let session: ort.InferenceSession | null = null;
@@ -91,18 +91,40 @@ async function initializeModel(): Promise<void> {
     });
     throw error; // Don't continue with failed initialization
   }
-}// Preprocess image for YOLOv5 input
-function preprocessImage(imageData: ImageData, targetSize: number): Float32Array {
+}// Preprocess image for YOLOv5 input with proper letterboxing
+function preprocessImage(imageData: ImageData, targetSize: number): {
+  input: Float32Array,
+  scale: number,
+  padX: number,
+  padY: number
+} {
+  const { width: originalWidth, height: originalHeight } = imageData;
+
+  // Calculate scale to fit image in target size while maintaining aspect ratio
+  const scale = Math.min(targetSize / originalWidth, targetSize / originalHeight);
+  const scaledWidth = Math.round(originalWidth * scale);
+  const scaledHeight = Math.round(originalHeight * scale);
+
+  // Calculate padding to center the image
+  const padX = Math.floor((targetSize - scaledWidth) / 2);
+  const padY = Math.floor((targetSize - scaledHeight) / 2);
+
+  console.log(`🔄 Letterbox: ${originalWidth}x${originalHeight} -> ${scaledWidth}x${scaledHeight} with padding (${padX}, ${padY}), scale: ${scale}`);
+
   const canvas = new OffscreenCanvas(targetSize, targetSize);
   const ctx = canvas.getContext('2d')!;
 
+  // Fill with gray background (typical for letterboxing)
+  ctx.fillStyle = '#808080';
+  ctx.fillRect(0, 0, targetSize, targetSize);
+
   // Create image from ImageData
-  const tempCanvas = new OffscreenCanvas(imageData.width, imageData.height);
+  const tempCanvas = new OffscreenCanvas(originalWidth, originalHeight);
   const tempCtx = tempCanvas.getContext('2d')!;
   tempCtx.putImageData(imageData, 0, 0);
 
-  // Resize to target size
-  ctx.drawImage(tempCanvas, 0, 0, targetSize, targetSize);
+  // Draw scaled image centered with letterboxing
+  ctx.drawImage(tempCanvas, padX, padY, scaledWidth, scaledHeight);
 
   // Get pixel data
   const resizedImageData = ctx.getImageData(0, 0, targetSize, targetSize);
@@ -121,7 +143,7 @@ function preprocessImage(imageData: ImageData, targetSize: number): Float32Array
     input[tensorIndex + 2 * targetSize * targetSize] = data[pixelIndex + 2] / 255.0; // B
   }
 
-  return input;
+  return { input, scale, padX, padY };
 }
 
 // Non-maximum suppression
@@ -172,8 +194,18 @@ function calculateIoU(box1: number[], box2: number[]): number {
   return intersectionArea / unionArea;
 }
 
-// Post-process YOLOv5 output
-function postprocess(output: Float32Array, options?: { dims?: number[] }): DetectionResult[] {
+// Post-process YOLOv5 output with letterbox coordinate mapping
+function postprocess(
+  output: Float32Array,
+  options?: {
+    dims?: number[],
+    scale?: number,
+    padX?: number,
+    padY?: number,
+    originalWidth?: number,
+    originalHeight?: number
+  }
+): DetectionResult[] {
   const detections: DetectionResult[] = [];
 
   // YOLOv5 output can be [1,25200,85] or [1,85,25200]
@@ -206,11 +238,12 @@ function postprocess(output: Float32Array, options?: { dims?: number[] }): Detec
       ? output[j * numDetections + i]
       : output[i * 85 + j];
 
-    // Extract box coordinates (center format)
+    // Extract box coordinates (center format) - these are in model input space (640x640)
     const centerX = getVal(0);
     const centerY = getVal(1);
     const width = getVal(2);
     const height = getVal(3);
+
     // Many YOLOv5 ONNX exports provide logits; apply sigmoid for probabilities
     const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
     const objectConfidence = sigmoid(getVal(4));
@@ -238,14 +271,26 @@ function postprocess(output: Float32Array, options?: { dims?: number[] }): Detec
     const finalScore = objectConfidence * bestClassScore;
     if (finalScore < CONFIDENCE_THRESHOLD) continue;
 
-    // Convert center format to corner format
-    // Heuristic: if coordinates look already normalized (<= 1.5), skip dividing by input size
-    const looksNormalized = Math.max(centerX, centerY, width, height) <= 1.5;
-    const scale = looksNormalized ? 1 : MODEL_INPUT_SIZE;
-    const x1 = Math.min(1, Math.max(0, (centerX - width / 2) / scale));
-    const y1 = Math.min(1, Math.max(0, (centerY - height / 2) / scale));
-    const x2 = Math.min(1, Math.max(0, (centerX + width / 2) / scale));
-    const y2 = Math.min(1, Math.max(0, (centerY + height / 2) / scale));
+    // Convert center format to corner format in model input space
+    const x1_model = centerX - width / 2;
+    const y1_model = centerY - height / 2;
+    const x2_model = centerX + width / 2;
+    const y2_model = centerY + height / 2;
+
+    // Map from model input space back to original image space
+    // Remove letterbox padding and scale back
+    const { scale = 1, padX = 0, padY = 0, originalWidth = 640, originalHeight = 640 } = options || {};
+
+    const x1_original = ((x1_model - padX) / scale) / originalWidth;
+    const y1_original = ((y1_model - padY) / scale) / originalHeight;
+    const x2_original = ((x2_model - padX) / scale) / originalWidth;
+    const y2_original = ((y2_model - padY) / scale) / originalHeight;
+
+    // Clamp to valid range [0, 1]
+    const x1 = Math.min(1, Math.max(0, x1_original));
+    const y1 = Math.min(1, Math.max(0, y1_original));
+    const x2 = Math.min(1, Math.max(0, x2_original));
+    const y2 = Math.min(1, Math.max(0, y2_original));
 
     // Skip invalid boxes
     if (x2 <= x1 || y2 <= y1) continue;
@@ -263,17 +308,55 @@ function postprocess(output: Float32Array, options?: { dims?: number[] }): Detec
   for (const idx of keepIndices) {
     const [x1, y1, x2, y2] = boxes[idx];
 
-    detections.push({
+    const detection = {
       label: YOLO_CLASSES[classIds[idx]] || 'unknown',
       score: scores[idx],
       xmin: x1,
       ymin: y1,
       xmax: x2,
       ymax: y2,
-    });
+    };
+
+    // Debug log first few detections
+    if (detections.length < 3) {
+      console.log(`🔍 Valid detection ${detections.length}: ${detection.label} ${(detection.score * 100).toFixed(1)}% at [${detection.xmin.toFixed(3)}, ${detection.ymin.toFixed(3)}, ${detection.xmax.toFixed(3)}, ${detection.ymax.toFixed(3)}]`);
+    }
+
+    detections.push(detection);
   }
 
-  return detections.slice(0, 10); // Limit to top 10 detections
+  // Apply additional filtering for better quality detections
+  const filteredDetections = detections
+    .filter((det: DetectionResult) => {
+      // Detection coordinates are already normalized [0,1], so area is also normalized
+      const area = (det.xmax - det.xmin) * (det.ymax - det.ymin);
+
+      console.log(`🔍 Filtering ${det.label} ${(det.score * 100).toFixed(1)}%: normalized area=${area.toFixed(6)}`);
+
+      // More permissive filtering for normalized coordinates
+      if (area > 0.9 || area < 0.0001) { // 90% of image or less than 0.01%
+        console.log(`❌ Rejected due to area: ${area.toFixed(6)}`);
+        return false;
+      }
+
+      // For person class, be very lenient
+      if (det.label === 'person') {
+        const pass = det.score > 0.15;
+        console.log(`👤 Person score check: ${det.score.toFixed(3)} > 0.15? ${pass}`);
+        return pass;
+      }
+
+      // For other classes, still be permissive for testing
+      const pass = det.score > 0.2;
+      console.log(`🏷️  Other class score check: ${det.score.toFixed(3)} > 0.2? ${pass}`);
+      return pass;
+    })
+    .sort((a: DetectionResult, b: DetectionResult) => b.score - a.score) // Sort by confidence
+    .slice(0, 8); // Allow more detections
+
+  console.log(`🎯 After filtering: ${filteredDetections.length} detections`);
+
+  return filteredDetections;
 }
 
 // Convert Float32Array to Uint16Array (IEEE 754 half precision) for float16 ONNX input
@@ -359,8 +442,9 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
   try {
     console.log('🔍 Starting inference...');
 
-    // Preprocess image
-    const inputTensorF32 = preprocessImage(imageData, MODEL_INPUT_SIZE);
+    // Preprocess image with letterboxing
+    const preprocessResult = preprocessImage(imageData, MODEL_INPUT_SIZE);
+    const { input: inputTensorF32, scale, padX, padY } = preprocessResult;
     console.log('✅ Image preprocessed, tensor shape:', [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
 
     // Some exported models (your yolov5n.onnx) expect float16 input; convert
@@ -403,10 +487,17 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
     }
     console.log('📊 Output tensor size:', output.length);
 
-    // Post-process results
+    // Post-process results with letterboxing parameters
     // @ts-ignore
     const dims = (outputTensor as any).dims as number[] | undefined;
-    const detections = postprocess(output, { dims });
+    const detections = postprocess(output, {
+      dims,
+      scale,
+      padX,
+      padY,
+      originalWidth: imageData.width,
+      originalHeight: imageData.height
+    });
     console.log('🎯 Detections found:', detections.length);
 
     // Log detection details for debugging
