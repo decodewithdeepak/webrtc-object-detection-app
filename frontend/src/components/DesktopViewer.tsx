@@ -6,6 +6,7 @@ import { ObjectDetectionCanvas } from './ObjectDetectionCanvas';
 import { PerformanceMetrics as PerformanceComponent } from './PerformanceMetrics';
 import { BenchmarkComponent } from './BenchmarkComponent';
 import { globalMetrics } from '../utils/metrics';
+import { globalMetricsExporter } from '../utils/metrics-exporter';
 
 interface DesktopViewerProps {
   roomId: string;
@@ -144,8 +145,12 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
       workerRef.current.onmessage = (event) => {
         const { type, data } = event.data;
 
-        if (type === 'detection-result') {
-          const { capture_ts, recv_ts, inference_ts, detections: newDetections } = data;
+        if (type === 'model-ready') {
+          console.log('✅ ONNX model loaded and ready for inference');
+        } else if (type === 'model-error') {
+          console.error('❌ Failed to load ONNX model:', data.error);
+        } else if (type === 'detection-result') {
+          const { capture_ts, recv_ts, inference_ts, detections: newDetections, frame_id } = data;
 
           // Convert task format to display format
           const displayDetections: DetectionResult[] = newDetections.map((det: any) => ({
@@ -162,8 +167,16 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
           setDetections(displayDetections);
           setIsProcessing(false);
 
-          // Update task-compliant metrics
+          // Update both metrics systems
           globalMetrics.addTiming(capture_ts, recv_ts, inference_ts);
+          globalMetricsExporter.addTimingRecord(frame_id, capture_ts, recv_ts, inference_ts);
+          
+          // Add detection quality metrics
+          const avgConfidence = newDetections.length > 0 
+            ? newDetections.reduce((sum: number, det: any) => sum + det.score, 0) / newDetections.length 
+            : 0;
+          globalMetricsExporter.addDetectionMetrics(newDetections.length, avgConfidence);
+
           const realTimeStats = globalMetrics.getRealTimeStats();
 
           setMetrics(prev => ({
@@ -183,6 +196,10 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         console.error('Worker error:', error);
         setIsProcessing(false);
       };
+
+      // Initialize the ONNX model
+      console.log('🚀 Initializing ONNX model...');
+      workerRef.current.postMessage({ type: 'init' });
 
       console.log('Object detection worker initialized successfully');
     } catch (error) {

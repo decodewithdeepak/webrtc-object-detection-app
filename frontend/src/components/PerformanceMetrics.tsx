@@ -1,6 +1,7 @@
 import React from 'react';
-import { Activity, Clock, Zap, AlertTriangle } from 'lucide-react';
+import { Activity, Clock, Zap, AlertTriangle, Download } from 'lucide-react';
 import { PerformanceMetrics as MetricsType } from '../types/detection';
+import { globalMetricsExporter } from '../utils/metrics-exporter';
 
 interface PerformanceMetricsProps {
   metrics: MetricsType;
@@ -8,6 +9,10 @@ interface PerformanceMetricsProps {
 
 export const PerformanceMetrics: React.FC<PerformanceMetricsProps> = ({ metrics }) => {
   const dropRate = metrics.totalFrames > 0 ? (metrics.droppedFrames / metrics.totalFrames) * 100 : 0;
+
+  const handleExportMetrics = () => {
+    globalMetricsExporter.exportMetrics();
+  };
 
   return (
     <div className="bg-gray-800 rounded-lg p-4 space-y-3">
@@ -58,8 +63,16 @@ export const PerformanceMetrics: React.FC<PerformanceMetricsProps> = ({ metrics 
         </div>
       </div>
 
-      <div className="text-xs text-gray-400 mt-3 pt-3 border-t border-gray-600">
-        Total: {metrics.totalFrames} frames | Dropped: {metrics.droppedFrames} frames
+      <div className="text-xs text-gray-400 mt-3 pt-3 border-t border-gray-600 flex justify-between items-center">
+        <span>Total: {metrics.totalFrames} frames | Dropped: {metrics.droppedFrames} frames</span>
+        <button
+          onClick={handleExportMetrics}
+          className="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1 rounded-lg flex items-center gap-1 transition-colors"
+          title="Export detailed metrics as JSON"
+        >
+          <Download className="w-3 h-3" />
+          Export Metrics
+        </button>
       </div>
     </div>
   );
