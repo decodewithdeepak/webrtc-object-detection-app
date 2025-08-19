@@ -152,6 +152,8 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         } else if (type === 'detection-result') {
           const { capture_ts, recv_ts, inference_ts, detections: newDetections, frame_id } = data;
 
+          console.log('🔍 Raw detections from worker:', newDetections);
+
           // Convert task format to display format
           const displayDetections: DetectionResult[] = newDetections.map((det: any) => ({
             bbox: [
@@ -163,6 +165,8 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
             class: det.label,
             score: det.score
           }));
+
+          console.log('📋 Converted display detections:', displayDetections);
 
           setDetections(displayDetections);
           setIsProcessing(false);

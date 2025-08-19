@@ -330,6 +330,15 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
     // Post-process results
     const detections = postprocess(output);
     console.log('🎯 Detections found:', detections.length);
+    
+    // Log detection details for debugging
+    if (detections.length > 0) {
+      console.log('📋 Detection details:', detections.map(d => ({
+        label: d.label,
+        score: d.score.toFixed(2),
+        bbox: `(${d.xmin.toFixed(2)}, ${d.ymin.toFixed(2)}) to (${d.xmax.toFixed(2)}, ${d.ymax.toFixed(2)})`
+      })));
+    }
 
     return detections;
 
