@@ -170,10 +170,10 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
           // Update both metrics systems
           globalMetrics.addTiming(capture_ts, recv_ts, inference_ts);
           globalMetricsExporter.addTimingRecord(frame_id, capture_ts, recv_ts, inference_ts);
-          
+
           // Add detection quality metrics
-          const avgConfidence = newDetections.length > 0 
-            ? newDetections.reduce((sum: number, det: any) => sum + det.score, 0) / newDetections.length 
+          const avgConfidence = newDetections.length > 0
+            ? newDetections.reduce((sum: number, det: any) => sum + det.score, 0) / newDetections.length
             : 0;
           globalMetricsExporter.addDetectionMetrics(newDetections.length, avgConfidence);
 

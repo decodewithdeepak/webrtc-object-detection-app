@@ -38,7 +38,7 @@ const YOLO_CLASSES = [
 ];
 
 // Model configuration
-const MODEL_INPUT_SIZE = 320; // Low resource mode: 320x320
+const MODEL_INPUT_SIZE = 640; // Model expects 640x640 input
 const CONFIDENCE_THRESHOLD = 0.5;
 const NMS_THRESHOLD = 0.4;
 
@@ -53,10 +53,14 @@ async function initializeModel(): Promise<void> {
     console.log('🤖 Loading YOLOv5 ONNX model...');
 
     // Configure ONNX Runtime for WebAssembly execution
-    ort.env.wasm.wasmPaths = '/node_modules/onnxruntime-web/dist/';
+    // Use CDN for WASM files to avoid path issues
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/';
     ort.env.wasm.numThreads = 1; // Low resource mode
 
+    console.log('📦 ONNX Runtime configuration set');
+
     // Load the model
+    console.log('📁 Loading model from /models/yolov5n.onnx');
     session = await ort.InferenceSession.create('/models/yolov5n.onnx', {
       executionProviders: ['wasm'], // Use WebAssembly for CPU execution
       graphOptimizationLevel: 'all',
@@ -64,6 +68,8 @@ async function initializeModel(): Promise<void> {
 
     isInitialized = true;
     console.log('✅ ONNX model loaded successfully');
+    console.log('🔍 Model inputs:', session.inputNames);
+    console.log('📤 Model outputs:', session.outputNames);
 
     // Send initialization status to main thread
     self.postMessage({
@@ -73,14 +79,19 @@ async function initializeModel(): Promise<void> {
 
   } catch (error) {
     console.error('❌ Failed to load ONNX model:', error);
+    console.error('📋 Error details:', {
+      name: error instanceof Error ? error.name : 'Unknown',
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
+
     self.postMessage({
       type: 'model-error',
       data: { error: error instanceof Error ? error.message : 'Unknown error' }
     });
+    throw error; // Don't continue with failed initialization
   }
-}
-
-// Preprocess image for YOLOv5 input
+}// Preprocess image for YOLOv5 input
 function preprocessImage(imageData: ImageData, targetSize: number): Float32Array {
   const canvas = new OffscreenCanvas(targetSize, targetSize);
   const ctx = canvas.getContext('2d')!;
@@ -227,6 +238,61 @@ function postprocess(output: Float32Array): DetectionResult[] {
   return detections.slice(0, 10); // Limit to top 10 detections
 }
 
+// Convert Float32Array to Uint16Array for float16 tensors
+function float32ToFloat16(float32Array: Float32Array): Uint16Array {
+  const uint16Array = new Uint16Array(float32Array.length);
+
+  for (let i = 0; i < float32Array.length; i++) {
+    // Convert float32 to float16 (IEEE 754 half precision)
+    const float32 = float32Array[i];
+
+    // Handle special cases
+    if (float32 === 0) {
+      uint16Array[i] = 0;
+      continue;
+    }
+
+    // Get the IEEE 754 representation
+    const buffer = new ArrayBuffer(4);
+    const view = new DataView(buffer);
+    view.setFloat32(0, float32, true);
+    const bits = view.getUint32(0, true);
+
+    // Extract components
+    const sign = (bits >>> 31) & 0x1;
+    const exponent = (bits >>> 23) & 0xff;
+    const mantissa = bits & 0x7fffff;
+
+    // Convert to float16
+    let float16Exp = exponent - 127 + 15; // Rebias exponent
+    let float16Mantissa = mantissa >>> 13; // Keep top 10 bits
+
+    // Handle special cases
+    if (exponent === 0) {
+      // Zero or denormalized
+      float16Exp = 0;
+      float16Mantissa = 0;
+    } else if (exponent === 255) {
+      // Infinity or NaN
+      float16Exp = 31;
+      float16Mantissa = mantissa ? 1 : 0;
+    } else if (float16Exp <= 0) {
+      // Underflow to zero
+      float16Exp = 0;
+      float16Mantissa = 0;
+    } else if (float16Exp >= 31) {
+      // Overflow to infinity
+      float16Exp = 31;
+      float16Mantissa = 0;
+    }
+
+    // Combine components
+    uint16Array[i] = (sign << 15) | (float16Exp << 10) | float16Mantissa;
+  }
+
+  return uint16Array;
+}
+
 // Run real ONNX inference
 async function runRealInference(imageData: ImageData): Promise<DetectionResult[]> {
   if (!session || !isInitialized) {
@@ -234,31 +300,44 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
   }
 
   try {
+    console.log('🔍 Starting inference...');
+
     // Preprocess image
     const inputTensor = preprocessImage(imageData, MODEL_INPUT_SIZE);
+    console.log('✅ Image preprocessed, tensor shape:', [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
 
-    // Create input tensor
-    const tensor = new ort.Tensor('float32', inputTensor, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+    // Convert to Uint16Array for float16 tensor
+    const float16Data = float32ToFloat16(inputTensor);
+    console.log('✅ Converted to float16 format');
 
-    // Run inference
-    const feeds = { images: tensor };
+    // Create input tensor with float16 data type and Uint16Array
+    const tensor = new ort.Tensor('float16', float16Data, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+    console.log('✅ Input tensor created with float16 type');
+
+    // Use the actual input name from the model
+    const inputName = session.inputNames[0]; // Get the first input name
+    const feeds = { [inputName]: tensor };
+    console.log('🚀 Running inference with input name:', inputName);
+
     const results = await session.run(feeds);
+    console.log('✅ Inference completed, outputs:', Object.keys(results));
 
-    // Get output
-    const output = results.output0.data as Float32Array;
+    // Get output using the actual output name
+    const outputName = session.outputNames[0]; // Get the first output name
+    const output = results[outputName].data as Float32Array;
+    console.log('📊 Output tensor size:', output.length);
 
     // Post-process results
     const detections = postprocess(output);
+    console.log('🎯 Detections found:', detections.length);
 
     return detections;
 
   } catch (error) {
-    console.error('Inference error:', error);
+    console.error('❌ Inference error:', error);
     return [];
   }
-}
-
-// Process frame with real ONNX inference
+}// Process frame with real ONNX inference
 async function processFrame(data: any): Promise<FrameMessage> {
   const { frame_id, capture_ts, recv_ts, imageData } = data;
 
