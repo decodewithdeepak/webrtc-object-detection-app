@@ -26,6 +26,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
   const [isConnected, setIsConnected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [detections, setDetections] = useState<DetectionResult[]>([]);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [metrics, setMetrics] = useState<PerformanceMetrics>({
     fps: 0,
     inferenceTime: 0,
@@ -34,7 +35,16 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
     totalFrames: 0
   });
 
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  // Effect to handle remote stream updates
+  useEffect(() => {
+    if (remoteStream && videoRef.current) {
+      console.log('🔄 Updating video element with remote stream');
+      videoRef.current.srcObject = remoteStream;
+      videoRef.current.play().catch(e => {
+        console.log('Autoplay prevented, user interaction required:', e);
+      });
+    }
+  }, [remoteStream]);
 
   // Export metrics to JSON file
   const exportMetrics = () => {
@@ -58,26 +68,60 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      console.log('Connected to signaling server');
+      console.log('Desktop connected to signaling server');
+    });
+
+    socket.on('user-joined', (userId: string) => {
+      console.log('Mobile device joined room:', userId);
     });
 
     socket.on('offer', async (offer: RTCSessionDescriptionInit) => {
-      const peerConnection = initializePeerConnection();
-      await peerConnection.setRemoteDescription(offer);
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-      socket.emit('answer', { roomId, answer });
+      console.log('🎥 Received offer from mobile device');
+      try {
+        if (!peerConnectionRef.current) {
+          console.log('🔧 Initializing peer connection for incoming offer...');
+          initializePeerConnection();
+        }
+
+        const peerConnection = peerConnectionRef.current!;
+        console.log('📋 Setting remote description...');
+        await peerConnection.setRemoteDescription(offer);
+
+        console.log('📋 Creating answer...');
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+
+        console.log('📤 Sending answer to mobile...');
+        socket.emit('answer', { roomId, answer });
+
+        console.log('✅ Answer sent successfully');
+      } catch (error) {
+        console.error('❌ Error handling offer:', error);
+      }
     });
 
     socket.on('answer', async (answer: RTCSessionDescriptionInit) => {
+      console.log('Received answer');
       if (peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(answer);
+        try {
+          await peerConnectionRef.current.setRemoteDescription(answer);
+        } catch (error) {
+          console.error('Error setting remote description:', error);
+        }
       }
     });
 
     socket.on('ice-candidate', async (candidate: RTCIceCandidateInit) => {
-      if (peerConnectionRef.current) {
-        await peerConnectionRef.current.addIceCandidate(candidate);
+      console.log('🧊 Received ICE candidate from mobile');
+      if (peerConnectionRef.current && peerConnectionRef.current.remoteDescription) {
+        try {
+          await peerConnectionRef.current.addIceCandidate(candidate);
+          console.log('✅ ICE candidate added successfully');
+        } catch (error) {
+          console.error('❌ Error adding ICE candidate:', error);
+        }
+      } else {
+        console.log('⏳ Queuing ICE candidate (no remote description yet)');
       }
     });
 
@@ -154,11 +198,15 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
 
   const initializePeerConnection = () => {
     const peerConnection = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
     });
 
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {
+        console.log('🧊 Sending ICE candidate to mobile');
         socketRef.current.emit('ice-candidate', {
           roomId,
           candidate: event.candidate
@@ -167,16 +215,39 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
     };
 
     peerConnection.ontrack = (event) => {
+      console.log('🎥 Received video track from mobile!');
       const [stream] = event.streams;
+      console.log('Stream details:', {
+        id: stream.id,
+        tracks: stream.getTracks().length,
+        videoTracks: stream.getVideoTracks().length,
+        active: stream.active
+      });
+
       setRemoteStream(stream);
+
+      // Force video element update
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(e => {
+          console.log('Autoplay prevented, user interaction required:', e);
+        });
+        console.log('✅ Video stream attached to video element');
       }
     };
 
     peerConnection.onconnectionstatechange = () => {
+      console.log('🔗 Desktop connection state:', peerConnection.connectionState);
       const connected = peerConnection.connectionState === 'connected';
       setIsConnected(connected);
+
+      if (connected) {
+        console.log('🎉 WebRTC connection established! Video should be streaming now.');
+      }
+    };
+
+    peerConnection.oniceconnectionstatechange = () => {
+      console.log('🧊 ICE connection state:', peerConnection.iceConnectionState);
     };
 
     peerConnectionRef.current = peerConnection;
@@ -184,9 +255,17 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
   };
 
   const joinRoom = () => {
+    if (!roomId.trim()) {
+      alert('Please enter a room ID');
+      return;
+    }
+
     if (socketRef.current) {
+      console.log('🚪 Desktop joining room:', roomId);
       socketRef.current.emit('join-room', roomId);
-      initializePeerConnection();
+
+      // Don't initialize peer connection here - wait for offer from mobile
+      console.log('⏳ Waiting for mobile device to connect...');
     }
   };
 
@@ -263,7 +342,17 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                     ref={videoRef}
                     autoPlay
                     playsInline
-                    className="w-full h-auto"
+                    muted
+                    controls
+                    className="w-full h-auto cursor-pointer"
+                    onLoadedMetadata={() => console.log('📹 Video metadata loaded')}
+                    onPlaying={() => console.log('▶️ Video started playing')}
+                    onError={(e) => console.error('❌ Video error:', e)}
+                    onClick={() => {
+                      if (videoRef.current) {
+                        videoRef.current.play().catch(e => console.log('Manual play failed:', e));
+                      }
+                    }}
                   />
                   <ObjectDetectionCanvas
                     videoRef={videoRef}
@@ -280,6 +369,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                   <div className="text-center">
                     <Monitor className="w-16 h-16 mx-auto mb-4 opacity-50" />
                     <p className="text-lg">Waiting for video stream...</p>
+                    <p className="text-sm mt-2">Make sure mobile device is connected to room</p>
                   </div>
                 </div>
               )}
@@ -307,6 +397,30 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                   />
                 </div>
 
+                {/* Connection Status */}
+                <div className="bg-gray-700 rounded-md p-3">
+                  <div className="text-sm space-y-1">
+                    <div className="flex justify-between">
+                      <span>WebRTC Status:</span>
+                      <span className={isConnected ? 'text-green-400' : 'text-yellow-400'}>
+                        {isConnected ? '🟢 Connected' : '🟡 Waiting'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Video Stream:</span>
+                      <span className={remoteStream ? 'text-green-400' : 'text-red-400'}>
+                        {remoteStream ? '🎥 Active' : '❌ None'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Peer Connection:</span>
+                      <span className={peerConnectionRef.current ? 'text-green-400' : 'text-gray-400'}>
+                        {peerConnectionRef.current ? '✅ Ready' : '⚪ None'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
                 <button
                   onClick={joinRoom}
                   disabled={isConnected}
@@ -318,7 +432,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                   {isConnected ? (
                     <>
                       <Users className="w-5 h-5 mr-2" />
-                      Connected
+                      Connected to Room
                     </>
                   ) : (
                     <>

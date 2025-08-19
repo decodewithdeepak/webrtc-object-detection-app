@@ -14,7 +14,19 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
+  const [isSocketConnected, setIsSocketConnected] = useState(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+
+  // Effect to handle local stream updates
+  useEffect(() => {
+    if (localStream && videoRef.current) {
+      console.log('🔄 Updating mobile video element with local stream');
+      videoRef.current.srcObject = localStream;
+      videoRef.current.play().catch(e => {
+        console.log('Mobile autoplay prevented:', e);
+      });
+    }
+  }, [localStream]);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const socketRef = useRef<any>(null);
 
@@ -26,27 +38,41 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      console.log('Connected to signaling server');
+      console.log('Mobile camera connected to signaling server');
+      setIsSocketConnected(true);
     });
 
-    socket.on('offer', async (offer: RTCSessionDescriptionInit) => {
-      if (peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(offer);
-        const answer = await peerConnectionRef.current.createAnswer();
-        await peerConnectionRef.current.setLocalDescription(answer);
-        socket.emit('answer', { roomId, answer });
-      }
+    socket.on('disconnect', () => {
+      console.log('Mobile camera disconnected from signaling server');
+      setIsSocketConnected(false);
+      setIsConnected(false);
+    });
+
+    socket.on('user-joined', (userId: string) => {
+      console.log('Desktop viewer joined room:', userId);
     });
 
     socket.on('answer', async (answer: RTCSessionDescriptionInit) => {
+      console.log('Received answer from desktop');
       if (peerConnectionRef.current) {
-        await peerConnectionRef.current.setRemoteDescription(answer);
+        try {
+          await peerConnectionRef.current.setRemoteDescription(answer);
+          console.log('Answer set successfully');
+        } catch (error) {
+          console.error('Error setting remote description:', error);
+        }
       }
     });
 
     socket.on('ice-candidate', async (candidate: RTCIceCandidateInit) => {
-      if (peerConnectionRef.current) {
-        await peerConnectionRef.current.addIceCandidate(candidate);
+      console.log('Received ICE candidate from desktop');
+      if (peerConnectionRef.current && peerConnectionRef.current.remoteDescription) {
+        try {
+          await peerConnectionRef.current.addIceCandidate(candidate);
+          console.log('ICE candidate added successfully');
+        } catch (error) {
+          console.error('Error adding ICE candidate:', error);
+        }
       }
     });
 
@@ -57,11 +83,15 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
 
   const initializePeerConnection = () => {
     const peerConnection = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
     });
 
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {
+        console.log('Sending ICE candidate to desktop');
         socketRef.current.emit('ice-candidate', {
           roomId,
           candidate: event.candidate
@@ -70,8 +100,17 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
     };
 
     peerConnection.onconnectionstatechange = () => {
+      console.log('Mobile connection state:', peerConnection.connectionState);
       const connected = peerConnection.connectionState === 'connected';
       setIsConnected(connected);
+
+      if (connected) {
+        console.log('✅ WebRTC connection established successfully!');
+      }
+    };
+
+    peerConnection.oniceconnectionstatechange = () => {
+      console.log('ICE connection state:', peerConnection.iceConnectionState);
     };
 
     peerConnectionRef.current = peerConnection;
@@ -103,17 +142,45 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
       }
 
       setLocalStream(stream);
+      console.log('✅ Local stream set in state');
+
       if (videoRef.current) {
+        console.log('📱 Attaching stream to mobile video element');
         videoRef.current.srcObject = stream;
+
+        // Add event listeners for debugging
+        videoRef.current.onloadedmetadata = () => {
+          console.log('📹 Mobile video metadata loaded');
+          console.log('Video dimensions:', videoRef.current?.videoWidth, 'x', videoRef.current?.videoHeight);
+        };
+
+        videoRef.current.onplay = () => console.log('▶️ Mobile video started playing');
+        videoRef.current.onpause = () => console.log('⏸️ Mobile video paused');
+
+        videoRef.current.play().catch(e => {
+          console.log('Mobile autoplay prevented:', e);
+        });
+      } else {
+        console.error('❌ Video ref is null!');
       }
 
       const peerConnection = initializePeerConnection();
+
+      // Add tracks to peer connection
       stream.getTracks().forEach(track => {
+        console.log('📤 Adding track to peer connection:', track.kind, track.label);
         peerConnection.addTrack(track, stream);
       });
 
+      console.log('Stream details:', {
+        id: stream.id,
+        tracks: stream.getTracks().length,
+        videoTracks: stream.getVideoTracks().length,
+        active: stream.active
+      });
+
       setIsStreaming(true);
-      console.log('Camera started successfully!');
+      console.log('✅ Camera started successfully!');
     } catch (error) {
       console.error('Error accessing camera:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown camera error';
@@ -122,21 +189,52 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
   };
 
   const startConnection = async () => {
-    console.log('Starting connection...');
-    if (!peerConnectionRef.current || !socketRef.current) {
-      console.error('Missing peer connection or socket');
+    console.log('🚀 Starting WebRTC connection...');
+
+    if (!roomId.trim()) {
+      alert('Please enter a room ID first!');
       return;
     }
 
-    console.log('Joining room:', roomId);
-    socketRef.current.emit('join-room', roomId);
+    if (!peerConnectionRef.current || !socketRef.current) {
+      console.error('❌ Missing peer connection or socket');
+      alert('Please start the camera first!');
+      return;
+    }
 
-    const offer = await peerConnectionRef.current.createOffer();
-    await peerConnectionRef.current.setLocalDescription(offer);
-    socketRef.current.emit('offer', { roomId, offer });
+    if (!localStream) {
+      console.error('❌ No local stream available');
+      alert('Please start the camera first!');
+      return;
+    }
+
+    try {
+      console.log('📱 Joining room:', roomId);
+      socketRef.current.emit('join-room', roomId);
+
+      // Wait a moment for the room join to complete
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      console.log('📋 Creating offer...');
+      const offer = await peerConnectionRef.current.createOffer({
+        offerToReceiveVideo: false,
+        offerToReceiveAudio: false
+      });
+
+      await peerConnectionRef.current.setLocalDescription(offer);
+      console.log('📤 Sending offer to desktop...');
+      socketRef.current.emit('offer', { roomId, offer });
+
+      console.log('⏳ Waiting for desktop to accept...');
+    } catch (error) {
+      console.error('❌ Error in startConnection:', error);
+      alert('Failed to start connection. Please try again.');
+    }
   };
 
   const stopStreaming = () => {
+    console.log('🛑 Stopping camera stream...');
+
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
       setLocalStream(null);
@@ -147,6 +245,8 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
     }
     setIsStreaming(false);
     setIsConnected(false);
+
+    console.log('✅ Camera stream stopped');
   };
 
   return (
@@ -170,16 +270,46 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
             />
           </div>
 
+          {/* Connection Status */}
+          <div className="bg-gray-700 rounded-md p-3 mb-4">
+            <div className="text-sm space-y-1">
+              <div className="flex justify-between">
+                <span>Camera:</span>
+                <span className={isStreaming ? 'text-green-400' : 'text-red-400'}>
+                  {isStreaming ? '🎥 Active' : '❌ Inactive'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span>Socket:</span>
+                <span className={isSocketConnected ? 'text-green-400' : 'text-red-400'}>
+                  {isSocketConnected ? '🟢 Connected' : '❌ Disconnected'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span>WebRTC:</span>
+                <span className={isConnected ? 'text-green-400' : 'text-yellow-400'}>
+                  {isConnected ? '🟢 Connected' : '🟡 Waiting'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span>Peer Connection:</span>
+                <span className={peerConnectionRef.current ? 'text-green-400' : 'text-gray-400'}>
+                  {peerConnectionRef.current ? '✅ Ready' : '⚪ None'}
+                </span>
+              </div>
+            </div>
+          </div>
+
           <div className="flex items-center justify-center mb-4">
             {isConnected ? (
               <div className="flex items-center text-green-400">
                 <Wifi className="w-5 h-5 mr-2" />
-                Connected
+                WebRTC Connected
               </div>
             ) : (
               <div className="flex items-center text-gray-400">
                 <WifiOff className="w-5 h-5 mr-2" />
-                Disconnected
+                Not Connected
               </div>
             )}
           </div>
@@ -218,14 +348,26 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         </div>
 
         {isStreaming && (
-          <div className="bg-gray-800 rounded-lg overflow-hidden">
+          <div className="bg-gray-800 rounded-lg overflow-hidden relative">
             <video
               ref={videoRef}
               autoPlay
               playsInline
               muted
-              className="w-full h-auto"
+              controls
+              className="w-full h-auto cursor-pointer"
+              onLoadedMetadata={() => console.log('📹 Mobile camera metadata loaded')}
+              onPlaying={() => console.log('▶️ Mobile camera playing')}
+              onError={(e) => console.error('❌ Mobile camera error:', e)}
+              onClick={() => {
+                if (videoRef.current) {
+                  videoRef.current.play().catch(e => console.log('Manual mobile play failed:', e));
+                }
+              }}
             />
+            <div className="absolute top-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-xs">
+              📱 Your Camera
+            </div>
           </div>
         )}
       </div>
