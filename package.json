@@ -1,0 +1,26 @@
+{
+  "name": "webrtc-object-detection-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Real-time WebRTC VLM Multi-Object Detection System",
+  "scripts": {
+    "install:all": "npm install && cd frontend && npm install && cd ../backend && npm install",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && npm start",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "start": "npm run dev",
+    "build:frontend": "cd frontend && npm run build",
+    "build": "npm run build:frontend",
+    "lint": "cd frontend && npm run lint"
+  },
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  },
+  "author": "",
+  "license": "MIT"
+}
