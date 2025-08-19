@@ -211,9 +211,9 @@ function postprocess(output: Float32Array, options?: { dims?: number[] }): Detec
     const centerY = getVal(1);
     const width = getVal(2);
     const height = getVal(3);
-  // Many YOLOv5 ONNX exports provide logits; apply sigmoid for probabilities
-  const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
-  const objectConfidence = sigmoid(getVal(4));
+    // Many YOLOv5 ONNX exports provide logits; apply sigmoid for probabilities
+    const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
+    const objectConfidence = sigmoid(getVal(4));
 
     // Debug first few detections
     if (i < 5) {
@@ -238,14 +238,14 @@ function postprocess(output: Float32Array, options?: { dims?: number[] }): Detec
     const finalScore = objectConfidence * bestClassScore;
     if (finalScore < CONFIDENCE_THRESHOLD) continue;
 
-  // Convert center format to corner format
-  // Heuristic: if coordinates look already normalized (<= 1.5), skip dividing by input size
-  const looksNormalized = Math.max(centerX, centerY, width, height) <= 1.5;
-  const scale = looksNormalized ? 1 : MODEL_INPUT_SIZE;
-  const x1 = Math.min(1, Math.max(0, (centerX - width / 2) / scale));
-  const y1 = Math.min(1, Math.max(0, (centerY - height / 2) / scale));
-  const x2 = Math.min(1, Math.max(0, (centerX + width / 2) / scale));
-  const y2 = Math.min(1, Math.max(0, (centerY + height / 2) / scale));
+    // Convert center format to corner format
+    // Heuristic: if coordinates look already normalized (<= 1.5), skip dividing by input size
+    const looksNormalized = Math.max(centerX, centerY, width, height) <= 1.5;
+    const scale = looksNormalized ? 1 : MODEL_INPUT_SIZE;
+    const x1 = Math.min(1, Math.max(0, (centerX - width / 2) / scale));
+    const y1 = Math.min(1, Math.max(0, (centerY - height / 2) / scale));
+    const x2 = Math.min(1, Math.max(0, (centerX + width / 2) / scale));
+    const y2 = Math.min(1, Math.max(0, (centerY + height / 2) / scale));
 
     // Skip invalid boxes
     if (x2 <= x1 || y2 <= y1) continue;
@@ -359,14 +359,14 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
   try {
     console.log('🔍 Starting inference...');
 
-  // Preprocess image
-  const inputTensorF32 = preprocessImage(imageData, MODEL_INPUT_SIZE);
-  console.log('✅ Image preprocessed, tensor shape:', [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+    // Preprocess image
+    const inputTensorF32 = preprocessImage(imageData, MODEL_INPUT_SIZE);
+    console.log('✅ Image preprocessed, tensor shape:', [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
 
-  // Some exported models (your yolov5n.onnx) expect float16 input; convert
-  const f16 = float32ToFloat16(inputTensorF32);
-  const tensor = new ort.Tensor('float16', f16, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
-  console.log('✅ Input tensor created with float16 type');
+    // Some exported models (your yolov5n.onnx) expect float16 input; convert
+    const f16 = float32ToFloat16(inputTensorF32);
+    const tensor = new ort.Tensor('float16', f16, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+    console.log('✅ Input tensor created with float16 type');
 
     // Use the actual input name from the model
     const inputName = session.inputNames[0]; // Get the first input name

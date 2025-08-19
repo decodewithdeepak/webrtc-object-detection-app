@@ -102,7 +102,7 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
 
     try {
       peerConnection.addTransceiver('video', { direction: 'sendonly' });
-    } catch {}
+    } catch { }
 
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {
