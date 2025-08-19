@@ -29,12 +29,16 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
   }, [localStream]);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const socketRef = useRef<any>(null);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
   useEffect(() => {
     // Initialize Socket.IO connection
     // Use window.location.hostname to automatically detect the correct server address
-    const serverUrl = `ws://${window.location.hostname}:3001`;
-    const socket = io(serverUrl);
+    const defaultDev = `http://${window.location.hostname}:3001`;
+    const configured = (import.meta as any).env?.VITE_SIGNALING_URL as string | undefined;
+    const isDevPort = window.location.port === '5173';
+    const baseUrl = configured ?? (isDevPort ? defaultDev : '');
+    const socket = baseUrl ? io(baseUrl, { path: '/socket.io' }) : io({ path: '/socket.io' });
     socketRef.current = socket;
 
     socket.on('connect', () => {
@@ -58,6 +62,13 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         try {
           await peerConnectionRef.current.setRemoteDescription(answer);
           console.log('Answer set successfully');
+          // Flush queued ICE candidates
+          if (pendingIceCandidatesRef.current.length) {
+            for (const c of pendingIceCandidatesRef.current) {
+              try { await peerConnectionRef.current.addIceCandidate(c); } catch (e) { console.error(e); }
+            }
+            pendingIceCandidatesRef.current = [];
+          }
         } catch (error) {
           console.error('Error setting remote description:', error);
         }
@@ -73,7 +84,7 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         } catch (error) {
           console.error('Error adding ICE candidate:', error);
         }
-      }
+      } else { pendingIceCandidatesRef.current.push(candidate); }
     });
 
     return () => {
@@ -88,6 +99,10 @@ export const CameraCapture: React.FC<CameraCaptureProps> = ({
         { urls: 'stun:stun1.l.google.com:19302' }
       ]
     });
+
+    try {
+      peerConnection.addTransceiver('video', { direction: 'sendonly' });
+    } catch {}
 
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {

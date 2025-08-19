@@ -39,7 +39,7 @@ const YOLO_CLASSES = [
 
 // Model configuration
 const MODEL_INPUT_SIZE = 640; // Model expects 640x640 input
-const CONFIDENCE_THRESHOLD = 0.5;
+const CONFIDENCE_THRESHOLD = 0.05; // Lowered to encourage initial detections
 const NMS_THRESHOLD = 0.4;
 
 let session: ort.InferenceSession | null = null;
@@ -173,51 +173,89 @@ function calculateIoU(box1: number[], box2: number[]): number {
 }
 
 // Post-process YOLOv5 output
-function postprocess(output: Float32Array): DetectionResult[] {
+function postprocess(output: Float32Array, options?: { dims?: number[] }): DetectionResult[] {
   const detections: DetectionResult[] = [];
-  const numDetections = output.length / 85; // 85 = 4 bbox + 1 confidence + 80 classes
+
+  // YOLOv5 output can be [1,25200,85] or [1,85,25200]
+  // 85 = 4 bbox + 1 objectness + 80 classes
+  let numDetections = output.length / 85;
+  let transposed = false;
+  if (options?.dims && options.dims.length === 3) {
+    const [, d1, d2] = options.dims;
+    if (d1 === 85) {
+      // layout [1,85,25200]
+      transposed = true;
+      numDetections = d2;
+    } else if (d2 === 85) {
+      // layout [1,25200,85]
+      transposed = false;
+      numDetections = d1;
+    }
+  }
+
+  console.log(`📊 Processing ${numDetections} potential detections`);
 
   const boxes: number[][] = [];
   const scores: number[] = [];
   const classIds: number[] = [];
 
+  let passedConfidenceCount = 0;
+
   for (let i = 0; i < numDetections; i++) {
-    const offset = i * 85;
+    const getVal = (j: number) => transposed
+      ? output[j * numDetections + i]
+      : output[i * 85 + j];
 
     // Extract box coordinates (center format)
-    const centerX = output[offset];
-    const centerY = output[offset + 1];
-    const width = output[offset + 2];
-    const height = output[offset + 3];
-    const confidence = output[offset + 4];
+    const centerX = getVal(0);
+    const centerY = getVal(1);
+    const width = getVal(2);
+    const height = getVal(3);
+  // Many YOLOv5 ONNX exports provide logits; apply sigmoid for probabilities
+  const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
+  const objectConfidence = sigmoid(getVal(4));
 
-    if (confidence < CONFIDENCE_THRESHOLD) continue;
+    // Debug first few detections
+    if (i < 5) {
+      console.log(`🔍 Detection ${i}: centerX=${centerX}, centerY=${centerY}, w=${width}, h=${height}, conf=${objectConfidence}`);
+    }
 
-    // Find best class
+    if (objectConfidence < CONFIDENCE_THRESHOLD) continue;
+    passedConfidenceCount++;
+
+    // Find best class (sigmoid for multi-label; equivalent to per-class prob)
     let bestClassScore = 0;
     let bestClassId = 0;
 
     for (let j = 0; j < 80; j++) {
-      const classScore = output[offset + 5 + j];
+      const classScore = sigmoid(getVal(5 + j));
       if (classScore > bestClassScore) {
         bestClassScore = classScore;
         bestClassId = j;
       }
     }
 
-    const finalScore = confidence * bestClassScore;
+    const finalScore = objectConfidence * bestClassScore;
     if (finalScore < CONFIDENCE_THRESHOLD) continue;
 
-    // Convert center format to corner format
-    const x1 = (centerX - width / 2) / MODEL_INPUT_SIZE;
-    const y1 = (centerY - height / 2) / MODEL_INPUT_SIZE;
-    const x2 = (centerX + width / 2) / MODEL_INPUT_SIZE;
-    const y2 = (centerY + height / 2) / MODEL_INPUT_SIZE;
+  // Convert center format to corner format
+  // Heuristic: if coordinates look already normalized (<= 1.5), skip dividing by input size
+  const looksNormalized = Math.max(centerX, centerY, width, height) <= 1.5;
+  const scale = looksNormalized ? 1 : MODEL_INPUT_SIZE;
+  const x1 = Math.min(1, Math.max(0, (centerX - width / 2) / scale));
+  const y1 = Math.min(1, Math.max(0, (centerY - height / 2) / scale));
+  const x2 = Math.min(1, Math.max(0, (centerX + width / 2) / scale));
+  const y2 = Math.min(1, Math.max(0, (centerY + height / 2) / scale));
+
+    // Skip invalid boxes
+    if (x2 <= x1 || y2 <= y1) continue;
 
     boxes.push([x1, y1, x2, y2]);
     scores.push(finalScore);
     classIds.push(bestClassId);
   }
+
+  console.log(`✅ Passed confidence: ${passedConfidenceCount}, Final candidates: ${boxes.length}`);
 
   // Apply NMS
   const keepIndices = nms(boxes, scores, NMS_THRESHOLD);
@@ -228,69 +266,88 @@ function postprocess(output: Float32Array): DetectionResult[] {
     detections.push({
       label: YOLO_CLASSES[classIds[idx]] || 'unknown',
       score: scores[idx],
-      xmin: Math.max(0, x1),
-      ymin: Math.max(0, y1),
-      xmax: Math.min(1, x2),
-      ymax: Math.min(1, y2),
+      xmin: x1,
+      ymin: y1,
+      xmax: x2,
+      ymax: y2,
     });
   }
 
   return detections.slice(0, 10); // Limit to top 10 detections
 }
 
-// Convert Float32Array to Uint16Array for float16 tensors
-function float32ToFloat16(float32Array: Float32Array): Uint16Array {
-  const uint16Array = new Uint16Array(float32Array.length);
+// Convert Float32Array to Uint16Array (IEEE 754 half precision) for float16 ONNX input
+function float32ToFloat16(src: Float32Array): Uint16Array {
+  const dst = new Uint16Array(src.length);
+  const f32 = new Float32Array(1);
+  const i32 = new Int32Array(f32.buffer);
+  for (let i = 0; i < src.length; i++) {
+    f32[0] = src[i];
+    const x = i32[0];
+    const sign = (x >>> 16) & 0x8000;
+    let mant = x & 0x007fffff;
+    let exp = (x >>> 23) & 0xff;
 
-  for (let i = 0; i < float32Array.length; i++) {
-    // Convert float32 to float16 (IEEE 754 half precision)
-    const float32 = float32Array[i];
-
-    // Handle special cases
-    if (float32 === 0) {
-      uint16Array[i] = 0;
+    if (exp === 255) {
+      // Inf/NaN
+      dst[i] = sign | 0x7c00 | (mant ? 1 : 0);
       continue;
     }
 
-    // Get the IEEE 754 representation
-    const buffer = new ArrayBuffer(4);
-    const view = new DataView(buffer);
-    view.setFloat32(0, float32, true);
-    const bits = view.getUint32(0, true);
-
-    // Extract components
-    const sign = (bits >>> 31) & 0x1;
-    const exponent = (bits >>> 23) & 0xff;
-    const mantissa = bits & 0x7fffff;
-
-    // Convert to float16
-    let float16Exp = exponent - 127 + 15; // Rebias exponent
-    let float16Mantissa = mantissa >>> 13; // Keep top 10 bits
-
-    // Handle special cases
-    if (exponent === 0) {
-      // Zero or denormalized
-      float16Exp = 0;
-      float16Mantissa = 0;
-    } else if (exponent === 255) {
-      // Infinity or NaN
-      float16Exp = 31;
-      float16Mantissa = mantissa ? 1 : 0;
-    } else if (float16Exp <= 0) {
-      // Underflow to zero
-      float16Exp = 0;
-      float16Mantissa = 0;
-    } else if (float16Exp >= 31) {
-      // Overflow to infinity
-      float16Exp = 31;
-      float16Mantissa = 0;
+    if (exp > 112) { // exp - 127 + 15 > 0
+      exp = exp - 112; // = exp - 127 + 15
+      if (exp >= 31) {
+        // Overflow to Inf
+        dst[i] = sign | 0x7c00;
+      } else {
+        // Normalized
+        dst[i] = sign | (exp << 10) | (mant >> 13);
+      }
+      continue;
     }
 
-    // Combine components
-    uint16Array[i] = (sign << 15) | (float16Exp << 10) | float16Mantissa;
+    if (exp < 113) { // May be subnormal or zero
+      if (exp < 103) {
+        // Too small becomes signed zero
+        dst[i] = sign;
+      } else {
+        // Subnormal
+        mant = mant | 0x00800000; // add implicit leading 1
+        const shift = 114 - exp; // 1 + (127-15) - exp
+        let halfMant = mant >> shift;
+        // Round to nearest
+        const roundBit = (mant >> (shift - 1)) & 1;
+        halfMant += roundBit;
+        dst[i] = sign | (halfMant >> 13);
+      }
+      continue;
+    }
   }
+  return dst;
+}
 
-  return uint16Array;
+// Convert Float16 (Uint16Array) to Float32Array for post-processing
+function float16ToFloat32(src: Uint16Array): Float32Array {
+  const out = new Float32Array(src.length);
+  for (let i = 0; i < src.length; i++) {
+    const h = src[i];
+    const s = (h & 0x8000) >> 15;
+    const e = (h & 0x7C00) >> 10;
+    const f = h & 0x03FF;
+    let val: number;
+    if (e === 0) {
+      // subnormal
+      val = (s ? -1 : 1) * Math.pow(2, -14) * (f / Math.pow(2, 10));
+    } else if (e === 0x1F) {
+      // NaN or Inf
+      val = f ? NaN : ((s ? -1 : 1) * Infinity);
+    } else {
+      // normal
+      val = (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / Math.pow(2, 10));
+    }
+    out[i] = val;
+  }
+  return out;
 }
 
 // Run real ONNX inference
@@ -302,17 +359,14 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
   try {
     console.log('🔍 Starting inference...');
 
-    // Preprocess image
-    const inputTensor = preprocessImage(imageData, MODEL_INPUT_SIZE);
-    console.log('✅ Image preprocessed, tensor shape:', [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+  // Preprocess image
+  const inputTensorF32 = preprocessImage(imageData, MODEL_INPUT_SIZE);
+  console.log('✅ Image preprocessed, tensor shape:', [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
 
-    // Convert to Uint16Array for float16 tensor
-    const float16Data = float32ToFloat16(inputTensor);
-    console.log('✅ Converted to float16 format');
-
-    // Create input tensor with float16 data type and Uint16Array
-    const tensor = new ort.Tensor('float16', float16Data, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
-    console.log('✅ Input tensor created with float16 type');
+  // Some exported models (your yolov5n.onnx) expect float16 input; convert
+  const f16 = float32ToFloat16(inputTensorF32);
+  const tensor = new ort.Tensor('float16', f16, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+  console.log('✅ Input tensor created with float16 type');
 
     // Use the actual input name from the model
     const inputName = session.inputNames[0]; // Get the first input name
@@ -324,13 +378,37 @@ async function runRealInference(imageData: ImageData): Promise<DetectionResult[]
 
     // Get output using the actual output name
     const outputName = session.outputNames[0]; // Get the first output name
-    const output = results[outputName].data as Float32Array;
+    const outputTensor = results[outputName];
+    const rawData: any = (outputTensor as any).data;
+    let output: Float32Array;
+    if (rawData instanceof Float32Array) {
+      output = rawData as Float32Array;
+      console.log('📦 Output dtype: float32');
+    } else if (rawData instanceof Uint16Array) {
+      console.log('📦 Output dtype: float16 (decoding to float32)');
+      output = float16ToFloat32(rawData as Uint16Array);
+    } else if (Array.isArray(rawData)) {
+      output = new Float32Array(rawData as number[]);
+      console.log('📦 Output dtype: array -> float32');
+    } else {
+      // Fallback
+      output = Float32Array.from(rawData as Iterable<number>);
+      console.log('📦 Output dtype: unknown, coerced to float32');
+    }
+    // Optional: log dims if available for debugging
+    // @ts-ignore
+    if ((outputTensor as any).dims) {
+      // @ts-ignore
+      console.log('📏 Output dims:', (outputTensor as any).dims);
+    }
     console.log('📊 Output tensor size:', output.length);
 
     // Post-process results
-    const detections = postprocess(output);
+    // @ts-ignore
+    const dims = (outputTensor as any).dims as number[] | undefined;
+    const detections = postprocess(output, { dims });
     console.log('🎯 Detections found:', detections.length);
-    
+
     // Log detection details for debugging
     if (detections.length > 0) {
       console.log('📋 Detection details:', detections.map(d => ({

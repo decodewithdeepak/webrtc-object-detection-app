@@ -180,7 +180,7 @@ class MetricsExporter {
             timestamp,
             configuration: {
                 model: 'YOLOv5n',
-                input_resolution: '320x320',
+                input_resolution: '640x640',
                 backend: 'ONNX Runtime Web (WASM)',
                 device: 'CPU',
                 threads: 1

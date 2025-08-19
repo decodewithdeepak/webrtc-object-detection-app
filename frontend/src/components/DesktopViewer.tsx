@@ -23,6 +23,8 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const socketRef = useRef<any>(null);
   const processIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const processingRef = useRef<boolean>(false);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
   const [isConnected, setIsConnected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -63,9 +65,12 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
 
   useEffect(() => {
     // Initialize Socket.IO connection
-    // Use window.location.hostname to automatically detect the correct server address
-    const serverUrl = `ws://${window.location.hostname}:3001`;
-    const socket = io(serverUrl);
+    // Dev: connect directly to backend:3001; Prod: same-origin (behind proxy)
+    const defaultDev = `http://${window.location.hostname}:3001`;
+    const configured = (import.meta as any).env?.VITE_SIGNALING_URL as string | undefined;
+    const isDevPort = window.location.port === '5173';
+    const baseUrl = configured ?? (isDevPort ? defaultDev : '');
+    const socket = baseUrl ? io(baseUrl, { path: '/socket.io' }) : io({ path: '/socket.io' });
     socketRef.current = socket;
 
     socket.on('connect', () => {
@@ -96,6 +101,19 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         socket.emit('answer', { roomId, answer });
 
         console.log('✅ Answer sent successfully');
+
+        // Flush any pending ICE candidates received before remote description was set
+        if (pendingIceCandidatesRef.current.length > 0) {
+          console.log(`🧊 Flushing ${pendingIceCandidatesRef.current.length} queued ICE candidates`);
+          for (const c of pendingIceCandidatesRef.current) {
+            try {
+              await peerConnection.addIceCandidate(c);
+            } catch (e) {
+              console.error('Failed to add queued ICE candidate:', e);
+            }
+          }
+          pendingIceCandidatesRef.current = [];
+        }
       } catch (error) {
         console.error('❌ Error handling offer:', error);
       }
@@ -123,6 +141,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         }
       } else {
         console.log('⏳ Queuing ICE candidate (no remote description yet)');
+        pendingIceCandidatesRef.current.push(candidate);
       }
     });
 
@@ -152,7 +171,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         } else if (type === 'detection-result') {
           const { capture_ts, recv_ts, inference_ts, detections: newDetections, frame_id } = data;
 
-          console.log('🔍 Raw detections from worker:', newDetections);
+          console.log('🔍 Raw detections from worker:', JSON.stringify(newDetections, null, 2));
 
           // Convert task format to display format
           const displayDetections: DetectionResult[] = newDetections.map((det: any) => ({
@@ -166,10 +185,12 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
             score: det.score
           }));
 
-          console.log('📋 Converted display detections:', displayDetections);
+          console.log('📋 Converted display detections:', JSON.stringify(displayDetections, null, 2));
+          console.log('📺 Video dimensions:', videoRef.current!.videoWidth, 'x', videoRef.current!.videoHeight);
 
           setDetections(displayDetections);
           setIsProcessing(false);
+          processingRef.current = false;
 
           // Update both metrics systems
           globalMetrics.addTiming(capture_ts, recv_ts, inference_ts);
@@ -193,12 +214,14 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         } else if (type === 'error') {
           console.error('Worker error:', data);
           setIsProcessing(false);
+          processingRef.current = false;
         }
       };
 
       workerRef.current.onerror = (error) => {
         console.error('Worker error:', error);
         setIsProcessing(false);
+        processingRef.current = false;
       };
 
       // Initialize the ONNX model
@@ -224,6 +247,13 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         { urls: 'stun:stun1.l.google.com:19302' }
       ]
     });
+
+    // Ensure we negotiate a receiving video transceiver
+    try {
+      peerConnection.addTransceiver('video', { direction: 'recvonly' });
+    } catch (e) {
+      console.warn('addTransceiver not supported or failed, relying on remote offer');
+    }
 
     peerConnection.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {
@@ -295,7 +325,11 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
     globalMetrics.reset(); // Reset metrics for new session
 
     processIntervalRef.current = setInterval(() => {
-      if (!videoRef.current || !canvasRef.current || !workerRef.current || isProcessing) {
+      if (!videoRef.current || !canvasRef.current || !workerRef.current) {
+        return;
+      }
+      if (processingRef.current) {
+        try { globalMetricsExporter.incrementDroppedFrames(); } catch { }
         return;
       }
 
@@ -320,6 +354,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
 
       // Send frame to worker with task-compliant format
       setIsProcessing(true);
+      processingRef.current = true;
       workerRef.current.postMessage({
         type: 'process-frame',
         data: {

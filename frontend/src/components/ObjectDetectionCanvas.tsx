@@ -68,12 +68,15 @@ export const ObjectDetectionCanvas: React.FC<ObjectDetectionCanvasProps> = ({
         const textWidth = textMetrics.width;
         const textHeight = 20;
 
+        // Clamp label within canvas top
+        const labelY = Math.max(textHeight + 6, y);
+
         ctx.fillStyle = color;
-        ctx.fillRect(x, y - textHeight - 4, textWidth + 12, textHeight + 4);
+        ctx.fillRect(x, labelY - textHeight - 4, textWidth + 12, textHeight + 4);
 
         // Draw label text
         ctx.fillStyle = '#000000';
-        ctx.fillText(label, x + 6, y - 8);
+        ctx.fillText(label, x + 6, labelY - 8);
       });
 
       requestAnimationFrame(drawDetections);
