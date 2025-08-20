@@ -30,6 +30,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
   const [isProcessing, setIsProcessing] = useState(false);
   const [detections, setDetections] = useState<DetectionResult[]>([]);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [isJoining, setIsJoining] = useState(false);
   const [metrics, setMetrics] = useState<PerformanceMetrics>({
     fps: 0,
     inferenceTime: 0,
@@ -41,10 +42,49 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
   // Effect to handle remote stream updates
   useEffect(() => {
     if (remoteStream && videoRef.current) {
-      console.log('🔄 Updating video element with remote stream');
+      console.log('🔄 Setting up remote stream on desktop video element');
+      console.log('Desktop video element state:', {
+        exists: !!videoRef.current,
+        currentSrc: videoRef.current.src,
+        currentSrcObject: !!videoRef.current.srcObject,
+        paused: videoRef.current.paused,
+        readyState: videoRef.current.readyState
+      });
+
       videoRef.current.srcObject = remoteStream;
-      videoRef.current.play().catch(e => {
-        console.log('Autoplay prevented, user interaction required:', e);
+
+      // Add event listeners for debugging
+      videoRef.current.onloadstart = () => console.log('📹 Desktop video loadstart');
+      videoRef.current.onloadeddata = () => console.log('📹 Desktop video loadeddata');
+      videoRef.current.oncanplay = () => console.log('📹 Desktop video canplay');
+      videoRef.current.onplay = () => console.log('▶️ Desktop video play event');
+      videoRef.current.onpause = () => console.log('⏸️ Desktop video pause event');
+
+      // Force load the video
+      videoRef.current.load();
+
+      // Simple autoplay handling
+      videoRef.current.play().then(() => {
+        console.log('✅ Desktop video auto-playing successfully');
+      }).catch((e) => {
+        console.log('Desktop autoplay prevented:', e);
+        // User can click the play button in the overlay
+      });
+    } else if (remoteStream && !videoRef.current) {
+      console.warn('⚠️ Remote stream available but video element not ready yet');
+    }
+  }, [remoteStream]);
+
+  // Additional effect to handle case where video element becomes available after stream
+  useEffect(() => {
+    if (remoteStream && videoRef.current && !videoRef.current.srcObject) {
+      console.log('🔄 Desktop video element now available, assigning pending stream...');
+      videoRef.current.srcObject = remoteStream;
+      videoRef.current.load();
+      videoRef.current.play().then(() => {
+        console.log('✅ Delayed desktop video assignment successful');
+      }).catch((e) => {
+        console.log('Delayed desktop autoplay prevented:', e);
       });
     }
   }, [remoteStream]);
@@ -83,6 +123,8 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
 
     socket.on('offer', async (offer: RTCSessionDescriptionInit) => {
       console.log('🎥 Received offer from mobile device');
+      console.log('Offer details:', offer);
+      setIsJoining(false); // Clear joining state
       try {
         if (!peerConnectionRef.current) {
           console.log('🔧 Initializing peer connection for incoming offer...');
@@ -92,15 +134,17 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         const peerConnection = peerConnectionRef.current!;
         console.log('📋 Setting remote description...');
         await peerConnection.setRemoteDescription(offer);
+        console.log('✅ Remote description set successfully');
 
         console.log('📋 Creating answer...');
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
+        console.log('✅ Local description (answer) set successfully');
 
         console.log('📤 Sending answer to mobile...');
         socket.emit('answer', { roomId, answer });
 
-        console.log('✅ Answer sent successfully');
+        console.log('✅ WebRTC Answer sent successfully - Connection establishing...');
 
         // Flush any pending ICE candidates received before remote description was set
         if (pendingIceCandidatesRef.current.length > 0) {
@@ -108,6 +152,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
           for (const c of pendingIceCandidatesRef.current) {
             try {
               await peerConnection.addIceCandidate(c);
+              console.log('✅ Queued ICE candidate added');
             } catch (e) {
               console.error('Failed to add queued ICE candidate:', e);
             }
@@ -116,6 +161,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         }
       } catch (error) {
         console.error('❌ Error handling offer:', error);
+        setIsJoining(false);
       }
     });
 
@@ -275,16 +321,20 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
         active: stream.active
       });
 
-      setRemoteStream(stream);
-
-      // Force video element update
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play().catch(e => {
-          console.log('Autoplay prevented, user interaction required:', e);
+      // Verify video tracks are active
+      const videoTracks = stream.getVideoTracks();
+      videoTracks.forEach((track, index) => {
+        console.log(`Video track ${index}:`, {
+          enabled: track.enabled,
+          readyState: track.readyState,
+          muted: track.muted,
+          label: track.label
         });
-        console.log('✅ Video stream attached to video element');
-      }
+      });
+
+      // Set the remote stream which will trigger the useEffect
+      setRemoteStream(stream);
+      console.log('✅ Remote stream set in state');
     };
 
     peerConnection.onconnectionstatechange = () => {
@@ -294,6 +344,49 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
 
       if (connected) {
         console.log('🎉 WebRTC connection established! Video should be streaming now.');
+
+        // Debug: Check what transceivers we have
+        const transceivers = peerConnection.getTransceivers();
+        console.log('📡 Desktop transceivers:', transceivers.length);
+        transceivers.forEach((transceiver, index) => {
+          console.log(`Transceiver ${index}:`, {
+            mid: transceiver.mid,
+            direction: transceiver.direction,
+            currentDirection: transceiver.currentDirection,
+            receiver: {
+              track: transceiver.receiver.track,
+              trackId: transceiver.receiver.track?.id,
+              trackKind: transceiver.receiver.track?.kind,
+              trackEnabled: transceiver.receiver.track?.enabled,
+              trackReadyState: transceiver.receiver.track?.readyState
+            }
+          });
+        });
+
+        // Check for remote streams using getReceivers (modern API)
+        const receivers = peerConnection.getReceivers();
+        const remoteStreams: MediaStream[] = [];
+        receivers.forEach((receiver) => {
+          if (receiver.track && receiver.track.kind === 'video') {
+            // Find streams from track
+            const streams = (receiver as any).streams || [];
+            streams.forEach((stream: MediaStream) => {
+              if (!remoteStreams.find(s => s.id === stream.id)) {
+                remoteStreams.push(stream);
+              }
+            });
+          }
+        });
+
+        console.log('📺 Remote streams count:', remoteStreams.length);
+        remoteStreams.forEach((stream: MediaStream, index: number) => {
+          console.log(`Remote stream ${index}:`, {
+            id: stream.id,
+            active: stream.active,
+            videoTracks: stream.getVideoTracks().length,
+            audioTracks: stream.getAudioTracks().length
+          });
+        });
       }
     };
 
@@ -311,11 +404,24 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
       return;
     }
 
+    if (isJoining || isConnected) {
+      console.log('Already joining or connected, ignoring request');
+      return;
+    }
+
+    setIsJoining(true);
+
     if (socketRef.current) {
       console.log('🚪 Desktop joining room:', roomId);
-      socketRef.current.emit('join-room', roomId);
 
-      // Don't initialize peer connection here - wait for offer from mobile
+      // Initialize peer connection BEFORE joining room
+      if (!peerConnectionRef.current) {
+        console.log('🔧 Pre-initializing peer connection...');
+        initializePeerConnection();
+        console.log('✅ Peer connection ready for incoming offer');
+      }
+
+      socketRef.current.emit('join-room', roomId);
       console.log('⏳ Waiting for mobile device to connect...');
     }
   };
@@ -388,9 +494,9 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
           <p className="text-gray-300">Real-time object detection from mobile camera stream</p>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Video Stream */}
-          <div className="lg:col-span-2">
+        <div className="flex flex-col xl:flex-row gap-6">
+          {/* Main Content Area - Video and Performance Cards */}
+          <div className="flex-1">
             <div className="bg-gray-800 rounded-lg overflow-hidden relative">
               {remoteStream ? (
                 <div className="relative">
@@ -401,9 +507,9 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                     muted
                     controls
                     className="w-full h-auto cursor-pointer"
-                    onLoadedMetadata={() => console.log('📹 Video metadata loaded')}
-                    onPlaying={() => console.log('▶️ Video started playing')}
-                    onError={(e) => console.error('❌ Video error:', e)}
+                    onLoadedMetadata={() => console.log('📹 Desktop video metadata loaded')}
+                    onPlaying={() => console.log('▶️ Desktop video started playing')}
+                    onError={(e) => console.error('❌ Desktop video error:', e)}
                     onClick={() => {
                       if (videoRef.current) {
                         videoRef.current.play().catch(e => console.log('Manual play failed:', e));
@@ -419,6 +525,28 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                     ref={canvasRef}
                     className="hidden"
                   />
+                  {/* Overlay for when video stream exists but not playing */}
+                  {remoteStream && videoRef.current && videoRef.current.paused && (
+                    <div className="absolute inset-0 bg-black bg-opacity-75 flex items-center justify-center">
+                      <div className="text-center text-white">
+                        <Monitor className="w-12 h-12 mx-auto mb-4" />
+                        <p className="text-lg mb-2">Video Stream Received</p>
+                        <p className="text-sm opacity-75">Click to start playback</p>
+                        <button
+                          onClick={() => {
+                            if (videoRef.current) {
+                              videoRef.current.play().then(() => {
+                                console.log('✅ Manual play successful');
+                              }).catch(e => console.log('Manual play failed:', e));
+                            }
+                          }}
+                          className="mt-3 bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md"
+                        >
+                          ▶️ Play Video
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="aspect-video flex items-center justify-center text-gray-400">
@@ -430,112 +558,21 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                 </div>
               )}
             </div>
-          </div>
 
-          {/* Controls and Metrics */}
-          <div className="space-y-6">
-            {/* Connection Controls */}
-            <div className="bg-gray-800 rounded-lg p-6">
-              <h3 className="text-lg font-semibold mb-4 flex items-center">
-                <Users className="w-5 h-5 mr-2 text-blue-400" />
-                Connection
-              </h3>
-
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium mb-2">Room ID</label>
-                  <input
-                    type="text"
-                    value={roomId}
-                    onChange={(e) => setRoomId(e.target.value)}
-                    className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-blue-400 focus:border-transparent"
-                    placeholder="Enter Room ID from mobile camera"
-                  />
-                </div>
-
-                {/* Connection Status */}
-                <div className="bg-gray-700 rounded-md p-3">
-                  <div className="text-sm space-y-1">
-                    <div className="flex justify-between">
-                      <span>WebRTC Status:</span>
-                      <span className={isConnected ? 'text-green-400' : 'text-yellow-400'}>
-                        {isConnected ? '🟢 Connected' : '🟡 Waiting'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>Video Stream:</span>
-                      <span className={remoteStream ? 'text-green-400' : 'text-red-400'}>
-                        {remoteStream ? '🎥 Active' : '❌ None'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>Peer Connection:</span>
-                      <span className={peerConnectionRef.current ? 'text-green-400' : 'text-gray-400'}>
-                        {peerConnectionRef.current ? '✅ Ready' : '⚪ None'}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                <button
-                  onClick={joinRoom}
-                  disabled={isConnected}
-                  className={`w-full py-3 px-4 rounded-md font-medium transition-colors flex items-center justify-center ${isConnected
-                    ? 'bg-green-600 text-white cursor-not-allowed'
-                    : 'bg-blue-500 hover:bg-blue-600 text-white'
-                    }`}
-                >
-                  {isConnected ? (
-                    <>
-                      <Users className="w-5 h-5 mr-2" />
-                      Connected to Room
-                    </>
-                  ) : (
-                    <>
-                      <Users className="w-5 h-5 mr-2" />
-                      Join Room
-                    </>
-                  )}
-                </button>
-              </div>
-            </div>
-
-            {/* Detection Controls */}
-            {remoteStream && (
-              <div className="bg-gray-800 rounded-lg p-6">
-                <h3 className="text-lg font-semibold mb-4 flex items-center">
-                  <Play className="w-5 h-5 mr-2 text-green-400" />
-                  Detection
-                </h3>
-
-                <div className="space-y-3">
-                  {!isProcessing && !processIntervalRef.current ? (
-                    <button
-                      onClick={startProcessing}
-                      className="w-full bg-green-500 hover:bg-green-600 text-white py-3 px-4 rounded-md font-medium transition-colors flex items-center justify-center"
-                    >
-                      <Play className="w-5 h-5 mr-2" />
-                      Start Detection
-                    </button>
-                  ) : (
-                    <button
-                      onClick={stopProcessing}
-                      className="w-full bg-red-500 hover:bg-red-600 text-white py-3 px-4 rounded-md font-medium transition-colors flex items-center justify-center"
-                    >
-                      <Square className="w-5 h-5 mr-2" />
-                      Stop Detection
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Performance Metrics */}
+            {/* Performance Metrics, Benchmark, and Export - Full Width Stacked Layout */}
             {(isProcessing || processIntervalRef.current) && (
-              <>
-                <PerformanceComponent metrics={metrics} />
+              <div className="mt-6 space-y-6">
+                {/* Performance Metrics */}
+                <div className="bg-gray-800 rounded-lg">
+                  <PerformanceComponent metrics={metrics} />
+                </div>
 
-                {/* Metrics Export */}
+                {/* Performance Benchmark */}
+                <div className="bg-gray-800 rounded-lg">
+                  <BenchmarkComponent />
+                </div>
+
+                {/* Export Metrics */}
                 <div className="bg-gray-800 rounded-lg p-6">
                   <h3 className="text-lg font-semibold mb-4 flex items-center">
                     <Download className="w-5 h-5 mr-2 text-purple-400" />
@@ -549,12 +586,133 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({
                     Download metrics.json
                   </button>
                 </div>
-              </>
+              </div>
+            )}
+          </div>
+
+          {/* Sidebar - Controls */}
+          <div className="xl:w-80 space-y-6">
+            {/* Connection Controls */}
+            <div className="bg-gray-800 rounded-lg p-6">
+              <h3 className="text-lg font-semibold mb-4 flex items-center">
+                <Users className="w-5 h-5 mr-2 text-blue-400" />
+                Receive Video
+              </h3>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium mb-2">Enter Code from Mobile</label>
+                  <input
+                    type="text"
+                    value={roomId}
+                    onChange={(e) => setRoomId(e.target.value.toUpperCase())}
+                    className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:ring-2 focus:ring-blue-400 focus:border-transparent text-center font-mono text-lg"
+                    placeholder="6-DIGIT CODE"
+                    maxLength={6}
+                  />
+                </div>
+
+                {/* Connection Status */}
+                <div className="bg-gray-700 rounded-md p-3">
+                  <div className="text-sm space-y-1">
+                    <div className="flex justify-between">
+                      <span>Connection:</span>
+                      <span className={isConnected ? 'text-green-400' : 'text-yellow-400'}>
+                        {isConnected ? '🟢 Connected' : '🟡 Waiting'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Video Stream:</span>
+                      <span className={remoteStream ? 'text-green-400' : 'text-red-400'}>
+                        {remoteStream ? '🎥 Receiving' : '❌ None'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  onClick={joinRoom}
+                  disabled={isConnected || isJoining || !roomId.trim()}
+                  className={`w-full py-3 px-4 rounded-md font-medium transition-colors flex items-center justify-center ${isConnected
+                    ? 'bg-green-600 text-white cursor-not-allowed'
+                    : isJoining
+                      ? 'bg-yellow-600 text-white cursor-not-allowed'
+                      : !roomId.trim()
+                        ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                        : 'bg-blue-500 hover:bg-blue-600 text-white'
+                    }`}
+                >
+                  {isConnected ? (
+                    <>
+                      <Users className="w-5 h-5 mr-2" />
+                      Connected & Receiving Video
+                    </>
+                  ) : isJoining ? (
+                    <>
+                      <Users className="w-5 h-5 mr-2" />
+                      Waiting for Mobile...
+                    </>
+                  ) : (
+                    <>
+                      <Users className="w-5 h-5 mr-2" />
+                      Join Room
+                    </>
+                  )}
+                </button>
+
+                {/* Debug button for video refresh */}
+                {remoteStream && (
+                  <button
+                    onClick={() => {
+                      if (videoRef.current && remoteStream) {
+                        console.log('🔄 Manual desktop video refresh triggered');
+                        videoRef.current.srcObject = remoteStream;
+                        videoRef.current.load();
+                        videoRef.current.play().catch(console.error);
+                      }
+                    }}
+                    className="w-full mt-2 bg-gray-600 hover:bg-gray-500 text-white py-2 px-4 rounded-md text-sm transition-colors"
+                  >
+                    🔄 Refresh Video
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Auto-start Detection when video is received */}
+            {remoteStream && !isProcessing && !processIntervalRef.current && (
+              <div className="bg-gray-800 rounded-lg p-6">
+                <h3 className="text-lg font-semibold mb-4 flex items-center">
+                  <Play className="w-5 h-5 mr-2 text-green-400" />
+                  Object Detection
+                </h3>
+
+                <button
+                  onClick={startProcessing}
+                  className="w-full bg-green-500 hover:bg-green-600 text-white py-3 px-4 rounded-md font-medium transition-colors flex items-center justify-center"
+                >
+                  <Play className="w-5 h-5 mr-2" />
+                  Start Detection
+                </button>
+              </div>
             )}
 
-            {/* Benchmark Component */}
-            {(isProcessing || processIntervalRef.current) && (
-              <BenchmarkComponent />
+            {/* Stop Detection Control */}
+            {isProcessing && (
+              <div className="bg-gray-800 rounded-lg p-6">
+                <h3 className="text-lg font-semibold mb-4 flex items-center">
+                  <Play className="w-5 h-5 mr-2 text-green-400" />
+                  Object Detection
+                </h3>
+
+                <button
+                  onClick={stopProcessing}
+                  className="w-full bg-red-500 hover:bg-red-600 text-white py-3 px-4 rounded-md font-medium transition-colors flex items-center justify-center"
+                >
+                  <Square className="w-5 h-5 mr-2" />
+                  Stop Detection
+                </button>
+              </div>
             )}
           </div>
         </div>
